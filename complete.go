@@ -18,10 +18,49 @@ type AutoCompleter interface {
 	Do(line []rune, pos int) (newLine [][]rune, length int)
 }
 
+type AutoCompleterWithCandidates interface {
+	// Readline will pass the whole line and current offset to it.
+	//
+	// Completer returns completion candidates specifying the updated line and how to display
+	// the candidate option to the user.
+	//
+	// Example:
+	//
+	//     [go, git, git-shell]
+	//     Do("run g", 4) => [{"run go", "go"}, {"run git", "git"}, {"run git-shell", "git-shell"}]
+	//     Do("run gi", 5) => [{"run git-shell", "git-shell"}]
+	//     Do("run git", 6) => [{"run git-shell", "git-shell"}]
+	Complete(line []rune, pos int) []Candidate
+}
+
+type completerAdapter struct {
+	AutoCompleter
+}
+
+func (c *completerAdapter) Complete(line []rune, pos int) (cs []Candidate) {
+	lines, length := c.AutoCompleter.Do(line, pos)
+	if len(lines) == 0 {
+		return nil
+	}
+	for _, l := range lines {
+		c := Candidate{
+			NewLine: append(append(line[:pos], l...), line[pos:]...),
+			Display: append(line[pos-length:pos], l...),
+		}
+		cs = append(cs, c)
+	}
+	return
+}
+
 type TabCompleter struct{}
 
 func (t *TabCompleter) Do([]rune, int) ([][]rune, int) {
 	return [][]rune{[]rune("\t")}, 0
+}
+
+type Candidate struct {
+	NewLine []rune
+	Display []rune
 }
 
 type opCompleter struct {
@@ -31,9 +70,8 @@ type opCompleter struct {
 
 	inCompleteMode  bool
 	inSelectMode    bool
-	candidate       [][]rune
+	candidate       []Candidate
 	candidateSource []rune
-	candidateOff    int
 	candidateChoise int
 	candidateColNum int
 }
@@ -48,7 +86,7 @@ func newOpCompleter(w io.Writer, op *Operation, width int) *opCompleter {
 
 func (o *opCompleter) doSelect() {
 	if len(o.candidate) == 1 {
-		o.op.buf.WriteRunes(o.candidate[0])
+		o.writeCandidate(o.candidate[0])
 		o.ExitCompleteMode(false)
 		return
 	}
@@ -84,7 +122,15 @@ func (o *opCompleter) OnComplete() bool {
 
 	o.ExitCompleteSelectMode()
 	o.candidateSource = rs
-	newLines, offset := o.op.cfg.AutoComplete.Do(rs, buf.idx)
+
+	var ac AutoCompleterWithCandidates
+	if acc, ok := o.op.cfg.AutoComplete.(AutoCompleterWithCandidates); ok {
+		ac = acc
+	} else {
+		ac = &completerAdapter{o.op.cfg.AutoComplete}
+	}
+
+	newLines := ac.Complete(rs, buf.idx)
 	if len(newLines) == 0 {
 		o.ExitCompleteMode(false)
 		return true
@@ -93,21 +139,32 @@ func (o *opCompleter) OnComplete() bool {
 	// only Aggregate candidates in non-complete mode
 	if !o.IsInCompleteMode() {
 		if len(newLines) == 1 {
-			buf.WriteRunes(newLines[0])
+			o.writeCandidate(newLines[0])
 			o.ExitCompleteMode(false)
 			return true
 		}
 
-		same, size := runes.Aggregate(newLines)
-		if size > 0 {
-			buf.WriteRunes(same)
+		if same, ok := o.aggregate(newLines); ok {
+			o.writeCandidate(same)
 			o.ExitCompleteMode(false)
 			return true
 		}
 	}
 
-	o.EnterCompleteMode(offset, newLines)
+	o.EnterCompleteMode(newLines)
 	return true
+}
+
+func (o *opCompleter) aggregate(cs []Candidate) (Candidate, bool) {
+	var newLines [][]rune
+	newLines = append(newLines, o.candidateSource)
+	for _, c := range cs {
+		newLines = append(newLines, c.NewLine)
+	}
+	if same, size := runes.Aggregate(newLines); size > len(o.candidateSource) {
+		return Candidate{NewLine: same}, true
+	}
+	return Candidate{}, false
 }
 
 func (o *opCompleter) IsInCompleteSelectMode() bool {
@@ -123,7 +180,7 @@ func (o *opCompleter) HandleCompleteSelect(r rune) bool {
 	switch r {
 	case CharEnter, CharCtrlJ:
 		next = false
-		o.op.buf.WriteRunes(o.op.candidate[o.op.candidateChoise])
+		o.writeCandidate(o.op.candidate[o.op.candidateChoise])
 		o.ExitCompleteMode(false)
 	case CharLineStart:
 		num := o.candidateChoise % o.candidateColNum
@@ -173,6 +230,15 @@ func (o *opCompleter) HandleCompleteSelect(r rune) bool {
 	return false
 }
 
+func (o *opCompleter) writeCandidate(c Candidate) {
+	if runes.HasPrefix(c.NewLine, o.candidateSource) {
+		o.op.buf.WriteRunes(c.NewLine[len(o.candidateSource):])
+	} else {
+		o.op.buf.Backspaces(len(o.candidateSource))
+		o.op.buf.WriteRunes(c.NewLine)
+	}
+}
+
 func (o *opCompleter) getMatrixSize() int {
 	line := len(o.candidate) / o.candidateColNum
 	if len(o.candidate)%o.candidateColNum != 0 {
@@ -192,13 +258,13 @@ func (o *opCompleter) CompleteRefresh() {
 	lineCnt := o.op.buf.CursorLineCount()
 	colWidth := 0
 	for _, c := range o.candidate {
-		w := runes.WidthAll(c)
+		w := runes.WidthAll(c.Display)
 		if w > colWidth {
 			colWidth = w
 		}
 	}
-	colWidth += o.candidateOff + 1
-	same := o.op.buf.RuneSlice(-o.candidateOff)
+
+	colWidth += 1
 
 	// -1 to avoid reach the end of line
 	width := o.width - 1
@@ -219,9 +285,8 @@ func (o *opCompleter) CompleteRefresh() {
 		if inSelect {
 			buf.WriteString("\033[30;47m")
 		}
-		buf.WriteString(string(same))
-		buf.WriteString(string(c))
-		buf.Write(bytes.Repeat([]byte(" "), colWidth-runes.WidthAll(c)-runes.WidthAll(same)))
+		buf.WriteString(string(c.Display))
+		buf.Write(bytes.Repeat([]byte(" "), colWidth-runes.WidthAll(c.Display)))
 
 		if inSelect {
 			buf.WriteString("\033[0m")
@@ -264,10 +329,9 @@ func (o *opCompleter) EnterCompleteSelectMode() {
 	o.CompleteRefresh()
 }
 
-func (o *opCompleter) EnterCompleteMode(offset int, candidate [][]rune) {
+func (o *opCompleter) EnterCompleteMode(candidates []Candidate) {
 	o.inCompleteMode = true
-	o.candidate = candidate
-	o.candidateOff = offset
+	o.candidate = candidates
 	o.CompleteRefresh()
 }
 
@@ -275,7 +339,6 @@ func (o *opCompleter) ExitCompleteSelectMode() {
 	o.inSelectMode = false
 	o.candidate = nil
 	o.candidateChoise = -1
-	o.candidateOff = -1
 	o.candidateSource = nil
 }
 

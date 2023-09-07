@@ -370,6 +370,25 @@ func (r *RuneBuffer) Backspace() {
 	})
 }
 
+func (r *RuneBuffer) Backspaces(n int) {
+	if n <= 0 {
+		return
+	}
+	r.Refresh(func() {
+		if r.idx == 0 {
+			return
+		}
+		d := n
+		if r.idx <= n {
+			d = r.idx
+			r.idx = 0
+		} else {
+			r.idx -= n
+		}
+		r.buf = append(r.buf[:r.idx], r.buf[r.idx+d:]...)
+	})
+}
+
 func (r *RuneBuffer) MoveToLineEnd() {
 	r.Refresh(func() {
 		if r.idx == len(r.buf) {
